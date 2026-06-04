@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FastAPI AI Document System</title>
+
+    <style>
+        body {
+            background-color: #d1d5db;
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-top: 40px;
+        }
+
+        h1 {
+            background-color: #2563eb;
+            color: white;
+            padding: 15px 30px;
+            border-radius: 8px;
+        }
+
+        .form-box {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-top: 20px;
+            width: 400px;
+            text-align: center;
+        }
+
+        textarea {
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <h1>AI Document Upload System</h1>
+    <div class="form-box">
+    <form id="uploadForm">
+        <input 
+            type="text" 
+            id="nameInput" 
+            placeholder="Enter Name"
+            required
+        >
+        <br><br>
+        <input 
+            type="email" 
+            id="emailInput" 
+            placeholder="Enter Email"
+            required
+        >
+        <br><br>
+        <input 
+            type="file" 
+            id="fileInput"
+            accept=".txt,.pdf,.docx,.png,.jpg,.jpeg"
+            required
+        >
+        <br><br>
+        <button type="submit">
+            Upload File
+        </button>
+    </form>
+</div>
+
+    <h2>Stored Chunks:</h2>
+    <div id="result"></div>
+    <script>
+        document.getElementById("uploadForm").addEventListener("submit", async function(e) {
+            e.preventDefault();
+            const name = document.getElementById("nameInput").value;
+            const email = document.getElementById("emailInput").value;
+            const file = document.getElementById("fileInput").files[0];
+            const formData = new FormData();
+            formData.append("name", name);
+            formData.append("email", email);
+            formData.append("file", file);
+            const response = await fetch('/upload', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await response.json();
+            let output = "";
+            data.chunks.forEach(item => {
+                output += `
+                    <div style="border:1px solid black; padding:15px; margin:15px; background-color:white; width:700px;">
+                        <h3>Chunk ID: ${item.chunk_id}</h3>
+                        <textarea
+                            id="chunk-${item.chunk_id}"
+                            rows="8"
+                            cols="100"
+                        >${item.chunk}</textarea>
+                        <br><br>
+                        <button onclick="saveChunk(${item.chunk_id})">
+                            Save Changes
+                        </button>
+                    </div>
+                `;
+            });
+            document.getElementById("result").innerHTML = output;
+        });
+        async function saveChunk(chunkId) {
+            const updatedChunk = document.getElementById(`chunk-${chunkId}`).value;
+            const response = await fetch('/update-chunk', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    chunk_id: chunkId,
+                    updated_chunk: updatedChunk
+                })
+            });
+            const data = await response.json();
+            alert(data.message);
+        }
+    </script>
+</body>
+</html>

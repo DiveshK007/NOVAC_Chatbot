@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flask Upload Demo</title>
+</head>
+<body>
+    <h1>FlaskAPI File Upload + Semantic Chunking</h1>
+    <form id="uploadForm">
+        <input type="file" id="fileInput">
+        <button type="submit">
+            Upload File
+        </button>
+    </form>
+    <h2>Stored Chunks:</h2>
+    <div id="result"></div>
+    <script>
+        document.getElementById("uploadForm").addEventListener("submit", async function(e) {
+            e.preventDefault();
+            const file = document.getElementById("fileInput").files[0];
+            const formData = new FormData();
+            formData.append("file", file);
+            const response = await fetch('/upload', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await response.json();
+            let output = "";
+            data.chunks.forEach(item => {
+                output += `
+                    <h3>Chunk ID: ${item.chunk_id}</h3>
+                    <p>${item.chunk}</p>
+                    <hr>
+                `;
+            });
+            document.getElementById("result").innerHTML = output;
+        });
+    </script>
+</body>
+</html>
