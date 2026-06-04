@@ -1329,30 +1329,33 @@ Content:
         present = [e for e in entities if _mentions_entity(combined_context, e)]
         missing = [e for e in entities if e not in present]
         if missing and CASE_STUDY_MODE:
-            # Case-study mode: don't refuse on an unknown name. Treat it as a placeholder
-            # for the document's illustration and answer with the document's own figures,
-            # transparently. The numbers still come only from the context (provenance guard
-            # unchanged), so this relabels the example rather than inventing anything.
+            # Case-study mode: don't refuse on an unknown name. Treat the name as the
+            # subject of the document's illustration and answer naturally for it, using the
+            # document's own figures (no disclaimer about the name). The numbers still come
+            # only from the context (provenance guard unchanged), so this relabels the
+            # example to the asked name rather than inventing anything.
             entity_note = (
                 "\nNAME HANDLING (authoritative — follow exactly, override rule 9):\n"
-                f"- These names are NOT written in the document: {', '.join(missing)}.\n"
-                "- The document is a template/illustration, so treat each such name as a "
-                "placeholder for the document's sample case. Answer the question for that "
-                "name USING the document's illustrative figures from the context.\n"
+                f"- These names are NOT written in the document: {', '.join(missing)}. The "
+                "document is a template/illustration, so treat each such name as the subject "
+                "of the document's sample case and answer for that name using the document's "
+                "illustrative figures from the context.\n"
+                "- Use the provided name(s) NATURALLY, as if the document were about that "
+                "person. Do NOT say the name is missing from the document, and do NOT mention "
+                "which example the figures are borrowed from — just answer for the given name.\n"
                 "- DETERMINISTIC CHOICE: if the context contains MORE THAN ONE example/"
                 "illustration, ALWAYS use the one that appears FIRST in the context above "
                 "(reading top to bottom). Never pick arbitrarily and never switch examples "
                 "within one answer.\n"
-                "- SCENARIO MATCH: if the question pins a specific scenario value (a policy "
-                "year, term, age, premium amount, payout mode, etc.) that does NOT match the "
-                "value used in the example you are drawing from, do NOT present the example's "
-                "figures as the answer. Instead state plainly that the document only "
-                "illustrates the example's value (e.g. 'only the 65th policy year, not the "
-                "58th'), so a figure for the asked value is not available — UNLESS it can be "
-                "derived from numbers in the context via the calculation protocol.\n"
-                "- BEGIN your answer with one short line stating the name is not in the "
-                "document and that the figures are from its example (name which example/"
-                "entity in the document they belong to).\n"
+                "- SCENARIO MATCH (this is ONLY about numeric scenario values — NEVER about "
+                "the name; the name is always fine to substitute): if the question pins a "
+                "specific scenario NUMBER (a policy year, term, age, premium amount, payout "
+                "mode, etc.) that does NOT match the value behind the figures, do NOT present "
+                "those figures as the answer. Instead state that the document only covers the "
+                "example's value (e.g. 'the document only illustrates the 65th policy year, "
+                "not the 58th'), so a figure for the asked value is not available — UNLESS it "
+                "can be derived from numbers in the context via the calculation protocol. If "
+                "the question pins NO such scenario number, or it matches, just answer.\n"
                 "- Use ONLY numbers that appear in the context; never invent new values. "
                 "If the context has NO relevant figures to illustrate the answer, only then "
                 "say the information is not found.\n"
