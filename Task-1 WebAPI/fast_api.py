@@ -183,6 +183,15 @@ SUPPORTED_PROVIDERS = {"mistral", "groq", "grok"}
 # writes the final prose. Pure model routing — nothing document-specific is hardcoded.
 MATH_PROVIDER = "groq"
 
+# Case-study mode: when a question names a person/subject that is NOT in the document,
+# treat the name as a placeholder for the document's illustrative example and answer using
+# the document's own figures — but ALWAYS state up front that the name isn't in the
+# document and name the example the figures come from. Numbers still must appear verbatim
+# in the context (the provenance guard is untouched), so this never fabricates values; it
+# only relabels the document's example. Set False for strict grounding (unknown name ->
+# "not found"). Generic: no document- or name-specific logic.
+CASE_STUDY_MODE = True
+
 def mistral_reply(prompt: str, temperature: float = 0.1, retries: int = 2) -> str:
     """Call Mistral with a couple of retries; on persistent failure return a
     graceful message instead of raising (so the chat never hard-fails)."""
@@ -696,8 +705,9 @@ _STRICT_RULES = """STRICT RULES:
    clearly and separately.
 8. Do NOT add advice, opinions, or extra explanations unless the user explicitly asks.
 9. If the answer simply is not present in the context (and is not derivable by arithmetic
-   from numbers that are), reply with exactly this sentence (translated into the user's
-   language): "Exact information not found in the retrieved document sections." """
+   from numbers that are, and no NAME HANDLING note above tells you otherwise), reply with
+   exactly this sentence (translated into the user's language): "Exact information not found
+   in the retrieved document sections." """
 
 _CALC_PROTOCOL = """CALCULATION PROTOCOL (this OVERRIDES the answer format below when math is needed):
 - TRIGGER — If the question asks for a value that is not written as-is but must be DERIVED
@@ -1318,7 +1328,34 @@ Content:
     if entities:
         present = [e for e in entities if _mentions_entity(combined_context, e)]
         missing = [e for e in entities if e not in present]
-        if present and missing:
+        if missing and CASE_STUDY_MODE:
+            # Case-study mode: don't refuse on an unknown name. Treat it as a placeholder
+            # for the document's illustration and answer with the document's own figures,
+            # transparently. The numbers still come only from the context (provenance guard
+            # unchanged), so this relabels the example rather than inventing anything.
+            entity_note = (
+                "\nNAME HANDLING (authoritative — follow exactly, override rule 9):\n"
+                f"- These names are NOT written in the document: {', '.join(missing)}.\n"
+                "- The document is a template/illustration, so treat each such name as a "
+                "placeholder for the document's sample case. Answer the question for that "
+                "name USING the document's illustrative figures from the context.\n"
+                "- DETERMINISTIC CHOICE: if the context contains MORE THAN ONE example/"
+                "illustration, ALWAYS use the one that appears FIRST in the context above "
+                "(reading top to bottom). Never pick arbitrarily and never switch examples "
+                "within one answer.\n"
+                "- BEGIN your answer with one short line stating the name is not in the "
+                "document and that the figures are from its example (name which example/"
+                "entity in the document they belong to).\n"
+                "- Use ONLY numbers that appear in the context; never invent new values. "
+                "If the context has NO relevant figures to illustrate the answer, only then "
+                "say the information is not found.\n"
+            )
+            if present:
+                entity_note += (
+                    f"- These names ARE in the document — answer them from their own "
+                    f"values: {', '.join(present)}.\n"
+                )
+        elif present and missing:
             entity_note = (
                 "\nFACT CHECK (use this — it is authoritative for these names):\n"
                 f"- Present in the context: {', '.join(present)}\n"
