@@ -4,7 +4,10 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pymongo import MongoClient, ReturnDocument
 import os
 import re
+import ast
+import operator as _op
 import string
+from decimal import Decimal, InvalidOperation
 import time
 import bcrypt
 import jwt
@@ -173,6 +176,13 @@ XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_BASE_URL = "https://api.x.ai/v1"
 SUPPORTED_PROVIDERS = {"mistral", "groq", "grok"}
 
+# The calc protocol (tool-based math) is triggered UNRELIABLY by some chat models —
+# mistral-small in particular tends to list the operands instead of emitting a calc
+# block. So the calc DECISION is routed to this provider (the one verified to trigger it
+# consistently) whenever the user's selected provider fails to; the user's provider still
+# writes the final prose. Pure model routing — nothing document-specific is hardcoded.
+MATH_PROVIDER = "groq"
+
 def mistral_reply(prompt: str, temperature: float = 0.1, retries: int = 2) -> str:
     """Call Mistral with a couple of retries; on persistent failure return a
     graceful message instead of raising (so the chat never hard-fails)."""
@@ -267,6 +277,178 @@ def extract_json_array(text: str) -> str:
     if start != -1 and end != -1 and end > start:
         return t[start:end + 1]
     return t
+
+# ---------------------------------------------------------------------------
+# Tool-based computation: safe arithmetic evaluator
+# ---------------------------------------------------------------------------
+# The LLM stays a reasoner/extractor — it pulls the relevant numbers out of the
+# retrieved context and decides what operation is needed. Python does the actual
+# arithmetic, so a stated figure is correct by construction rather than a
+# predicted (and sometimes silently wrong) digit. Only numeric literals and the
+# operators + - * / ** % ( ) are permitted — no names, calls, attributes, or
+# subscripts — so an expression can never execute arbitrary code.
+_ALLOWED_BINOPS = {
+    ast.Add: _op.add, ast.Sub: _op.sub, ast.Mult: _op.mul,
+    ast.Div: _op.truediv, ast.Pow: _op.pow, ast.Mod: _op.mod,
+}
+_ALLOWED_UNARYOPS = {ast.UAdd: _op.pos, ast.USub: _op.neg}
+
+class CalcError(Exception):
+    """Raised when an expression contains anything beyond safe arithmetic."""
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant):
+        # bool is a subclass of int — reject it so "True * 5" can't sneak through.
+        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+            raise CalcError("only numeric literals are allowed")
+        # Compute in Decimal, not float: money math must be exact. str() of the
+        # literal round-trips the value the user typed (e.g. 0.4913 -> "0.4913").
+        return Decimal(str(node.value))
+    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > 1000:
+            raise CalcError("exponent too large")
+        try:
+            return _ALLOWED_BINOPS[type(node.op)](left, right)
+        except ZeroDivisionError:
+            raise CalcError("division by zero")
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
+        return _ALLOWED_UNARYOPS[type(node.op)](_eval_node(node.operand))
+    raise CalcError("unsupported expression")
+
+def safe_eval_arithmetic(expr: str):
+    """Evaluate a pure-arithmetic expression safely. Raises CalcError on anything
+    that isn't numbers and + - * / ** % ( )."""
+    expr = (expr or "").strip()
+    if not expr or len(expr) > 200:
+        raise CalcError("empty or oversized expression")
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        raise CalcError("could not parse expression")
+    return _eval_node(tree.body)
+
+def format_number(value):
+    """Render a computed number cleanly: rounded to 4 dp with trailing zeros (and a
+    bare decimal point) stripped, so 6000.0000 -> "6000" and 8239.1010 -> "8239.101"."""
+    if isinstance(value, Decimal):
+        try:
+            value = value.quantize(Decimal("0.0001"))
+        except InvalidOperation:
+            pass  # result too large to quantize — fall back to its full form
+        s = format(value, "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{round(value, 4):f}".rstrip("0").rstrip(".")
+    return str(value)
+
+_CALC_BLOCK_RE = re.compile(r"```calc\s*(.+?)```", re.DOTALL | re.IGNORECASE)
+
+def extract_calc_requests(text: str):
+    """Pull the model's calc protocol block (a ```calc fenced JSON array) out of a
+    Pass-1 reply. Returns a list of {"expr", "label"} dicts, or [] if the reply is a
+    normal answer with no calc block (or the block is unparseable)."""
+    if not text:
+        return []
+    m = _CALC_BLOCK_RE.search(text)
+    if m:
+        payload = m.group(1)
+    elif '"expr"' in text and text.strip().startswith("["):
+        # Some models drop the fence and emit just the JSON array — accept that too.
+        payload = text.strip()
+    else:
+        return []
+    try:
+        items = json.loads(extract_json_array(payload))
+    except Exception:
+        return []
+    requests = []
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, dict) and str(it.get("expr", "")).strip():
+            requests.append({
+                "expr": str(it["expr"]).strip(),
+                "label": str(it.get("label", "")).strip(),
+            })
+    return requests
+
+# ---------------------------------------------------------------------------
+# Operand-provenance validation (the "no number-twisting" guard)
+# ---------------------------------------------------------------------------
+# Correct arithmetic on the WRONG numbers is still wrong — and silently so. Before
+# we compute anything, every DATA number in the expression must be proven to appear
+# verbatim in the retrieved context. If even one doesn't, the calculation is refused
+# (reported as not-found) rather than returning a confident wrong figure. This is the
+# difference between "the model promised it only used context numbers" and "the system
+# verified it." Matching is comma/currency-insensitive so the Indian grouping in the
+# document (₹1,50,000) lines up with the bare operand (150000) the model writes.
+#
+# A short, document-AGNOSTIC whitelist of unit/period conversion constants is allowed
+# without grounding (e.g. 100 for a percentage, 12 months, 4 quarters, 365 days). These
+# are arithmetic structure, not document data, so permitting them keeps "X% of Y" and
+# per-period math working without ever hardcoding anything about a specific document.
+_STRUCTURAL_CONSTANTS = {"0", "1", "2", "3", "4", "6", "12", "24", "52", "100", "360", "365"}
+_OPERAND_RE = re.compile(r"\d+(?:\.\d+)?")          # numbers as written inside an expr
+_CONTEXT_NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")  # numbers in prose (may carry commas)
+
+def _num_key(token: str):
+    """Canonical comparison key for a numeric string: drop digit-grouping commas and
+    insignificant trailing zeros so 16,770 / 16770 / 16770.00 all collapse to '16770'."""
+    try:
+        d = Decimal(token.replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return None
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+def extract_context_numbers(context: str):
+    """Set of canonical numeric keys for every number that appears in the context."""
+    keys = set()
+    for tok in _CONTEXT_NUM_RE.findall(context or ""):
+        key = _num_key(tok)
+        if key is not None:
+            keys.add(key)
+    return keys
+
+def ungrounded_operands(expr: str, context_keys):
+    """Operands in expr that are neither a structural constant nor present verbatim in
+    the context. A non-empty result means the expression must NOT be computed."""
+    missing = []
+    for tok in _OPERAND_RE.findall(expr):
+        key = _num_key(tok)
+        if key is None or key in _STRUCTURAL_CONSTANTS or key in context_keys:
+            continue
+        if tok not in missing:
+            missing.append(tok)
+    return missing
+
+def run_calculations(requests, context):
+    """Validate provenance, then evaluate each calc request in Python. Returns a list of
+    result dicts, each with the original label/expr plus either a computed 'result'
+    string or an 'error' (ungrounded operand, or unsafe/invalid expression)."""
+    context_keys = extract_context_numbers(context)
+    results = []
+    for req in requests:
+        entry = {"label": req["label"], "expr": req["expr"]}
+        missing = ungrounded_operands(req["expr"], context_keys)
+        if missing:
+            entry["error"] = (
+                "operand(s) not found verbatim in the context: " + ", ".join(missing)
+            )
+            results.append(entry)
+            continue
+        try:
+            entry["result"] = format_number(safe_eval_arithmetic(req["expr"]))
+        except CalcError as e:
+            entry["error"] = str(e)
+        results.append(entry)
+    return results
 
 def build_sources(chunks):
     """Shape chunks into source-card payloads for the frontend."""
@@ -467,6 +649,198 @@ def literal_filter_chunks(query: str, similarities):
         if all(tok in f"{c['chunk_title']} {c['chunk']}" for tok in constraints)
     ]
     return matches[:MAX_CONTEXT]
+
+# ---------------------------------------------------------------------------
+# Grounded answer generation (with optional Python-computed math pass)
+# ---------------------------------------------------------------------------
+# Shared rule blocks so Pass 1 (which may request a calculation) and Pass 2 (which
+# states the computed result) stay perfectly consistent in their grounding rules.
+_STRICT_RULES = """STRICT RULES:
+1. Answer ONLY from the retrieved context above. Never use outside knowledge.
+2. Every amount, percentage, date, name and number you state must appear VERBATIM in the
+   context. Preserve it EXACTLY as written. Never invent a value.
+3. ATTRIBUTION: Each value in the context belongs to the specific entity (person, item,
+   product, period, etc.) it is written next to. Always pair a value with that exact
+   entity. NEVER assign one entity's figure to a different one. If the question names an
+   entity, use only the value(s) written for THAT entity.
+4. PARTIAL ANSWERS ARE REQUIRED. If the question names one or more entities (people,
+   items, products, periods, etc.), handle EACH one independently:
+   - If an entity IS present in the context, answer using its own values.
+   - If an entity is NOT present, write one short line saying it is not found, then
+     CONTINUE and answer for every entity that IS present.
+   Do NOT return the rule-9 "not found" sentence as long as at least ONE named entity is
+   present — this holds even for a "compare side by side" question where another named
+   entity is missing. Use rule 9 ONLY when NONE of the named entities appear in the context.
+   - Extra unrelated figures for a present entity (a different metric than the one asked
+     about) are not a reason to refuse; simply ignore the ones that don't match the question.
+   Illustrative example (fictional, unrelated to any uploaded document) — question
+   "Compare Alice's and Bob's score", context contains "Bob's score: 42" but no Alice:
+     "Alice is not found in the document.
+      Bob — score: 42"
+5. COMPARING & SELECTING IS ALLOWED. You MAY compare, rank, or pick among values that
+   already appear in the context — e.g. "which one is highest", "compare X and Y side by
+   side", or listing items that meet a stated condition. Choosing the largest/smallest of
+   values already written in the context is NOT inventing a number; it is selecting one
+   that is present. When ranking, compare the ACTUAL numeric magnitude of each value
+   (read digit-grouping/commas and units carefully so a larger number is not mistaken for
+   a smaller one) and pick the true highest/lowest. Show the values you compared.
+6. ARITHMETIC IS DONE BY TOOL, NEVER IN YOUR HEAD. If the question needs a sum,
+   difference, product, quotient, percentage-of, or total-across-periods, you MUST derive
+   it via the CALCULATION PROTOCOL below — emit a calc block; do NOT just list the
+   operands and stop, and do NOT write the arithmetic out as text. Use ONLY numbers that
+   appear VERBATIM in the context as operands; never compute in your head. You still must NOT
+   introduce a new rate, term, premium, or assumption that is not written in the context
+   (e.g. a hypothetical figure the user invents); a value that depends on such an unknown
+   is not derivable and falls under rule 9.
+7. If several variants of a value apply (e.g. different rates or scenarios), show each one
+   clearly and separately.
+8. Do NOT add advice, opinions, or extra explanations unless the user explicitly asks.
+9. If the answer simply is not present in the context (and is not derivable by arithmetic
+   from numbers that are), reply with exactly this sentence (translated into the user's
+   language): "Exact information not found in the retrieved document sections." """
+
+_CALC_PROTOCOL = """CALCULATION PROTOCOL (this OVERRIDES the answer format below when math is needed):
+- TRIGGER — If the question asks for a value that is not written as-is but must be DERIVED
+  by arithmetic from numbers that ARE in the context, you MUST use this protocol. This
+  includes any difference, sum, total, "combined", "how much in total", product, ratio,
+  "X% of Y", or converting a per-year figure to per-month/quarter, etc.
+- In that case you MUST NOT write a normal answer, MUST NOT just list the operand values,
+  and MUST NOT write the arithmetic as prose (e.g. never output "17,62,189 - 13,65,300").
+  Instead reply with ONLY a fenced code block labelled calc containing a JSON array —
+  nothing else, no prose, no [LANG] tag:
+```calc
+[{"expr": "16770 * 0.4913", "label": "annual premium payable"}]
+```
+- "expr" may contain ONLY numbers taken verbatim from the context and the operators
+  + - * / ** ( ). Express a percentage as a division, e.g. 40.13% of 16770 -> "16770 * 40.13 / 100".
+- EVERY data number in "expr" must appear VERBATIM in the context (commas and currency
+  symbols are ignored when matching). Only basic conversion constants — 100 for a
+  percentage, 12 for months, 4 for quarters, 365 for days, and 1 — may be introduced.
+  The system VERIFIES this and will refuse to compute if any other number is not in the
+  context, so never fabricate or guess a figure.
+- Do NOT pre-combine numbers: write "1 + 5 / 100" not "1.05", and "16770 * 40.13 / 100"
+  not "16770 * 0.4013". Each data figure must be one that is literally written in the context.
+- Include multiple objects in the array if several values must be computed.
+- If NO arithmetic is needed, ignore this protocol and answer normally per the rules."""
+
+_ANSWER_FORMAT = """ANSWER FORMAT:
+- For a single fact: Line 1 is the direct answer; then at most one short supporting line
+  drawn straight from the context.
+- For a comparison/ranking: give the direct answer first (the winner, or "X vs Y"), then
+  list each entity with its value on its own line, each attributed by name.
+- Keep it concise and factual; never restate the question.
+
+LANGUAGE:
+- Answer in the EXACT same language and script as the user's question
+  (Hindi->Hindi, Tamil->Tamil, Tanglish->Tanglish, Hinglish->Hinglish, English->English)."""
+
+def build_answer_prompt(query, combined_context, entity_note):
+    """Pass-1 prompt: the model either answers directly or, if arithmetic on context
+    numbers is needed, emits a calc protocol block instead of computing it itself."""
+    return f"""
+You are NOVAC AI, a STRICT document-grounded extraction assistant. Your only job is to
+answer using the retrieved context below, for whatever document the user uploaded.
+
+User question:
+{query}
+{entity_note}
+
+Retrieved document context:
+{combined_context}
+
+{_STRICT_RULES}
+
+{_CALC_PROTOCOL}
+
+{_ANSWER_FORMAT}
+{LANG_TAG}
+
+Answer:
+"""
+
+def build_calc_answer_prompt(query, combined_context, entity_note, computed_lines):
+    """Pass-2 prompt: the math has already been done in Python. The model writes the
+    final grounded answer stating the exact computed value(s) — it must not recompute."""
+    return f"""
+You are NOVAC AI, a STRICT document-grounded extraction assistant.
+
+User question:
+{query}
+{entity_note}
+
+Retrieved document context:
+{combined_context}
+
+COMPUTED VALUES (calculated in Python from numbers in the context — these are EXACT and
+authoritative; state them verbatim and do NOT recompute or alter them):
+{computed_lines}
+
+Write the final answer using the context and these computed values:
+- State the relevant computed value(s) as the answer.
+- If a computed value is shown as "could not be computed", treat that figure as not found.
+- Never introduce a number that is neither in the context nor in the computed values.
+- Do NOT emit another calc block.
+
+{_ANSWER_FORMAT}
+{LANG_TAG}
+
+Answer:
+"""
+
+# Generic English math-intent signals — document-agnostic, in the same spirit as the
+# existing greeting/enumeration heuristics. Used only to decide whether it's worth a
+# fallback call to the reliable math provider; a miss simply leaves behaviour unchanged,
+# so this never gates correctness.
+_MATH_INTENT_RE = re.compile(
+    r"\b(difference|differ|how much (more|less|higher|lower)|more than|less than|"
+    r"total|sum|combined|altogether|adds? up|in total|overall|"
+    r"multiply|multiplied|times|product|divided?|ratio|"
+    r"average|mean|percent|percentage of|per annum|"
+    r"over \d+ (year|month|quarter|week|day)s?)\b",
+    re.IGNORECASE,
+)
+
+def looks_computational(query: str) -> bool:
+    """Best-effort: does the question read like it needs arithmetic on context numbers?"""
+    return bool(_MATH_INTENT_RE.search(query or ""))
+
+def generate_grounded_answer(query, combined_context, entity_note, provider):
+    """Generate the final answer, with an optional Python-computed math pass.
+    Pass 1: the model answers directly OR emits a calc protocol block. If it asked for
+    arithmetic, evaluate it safely in Python and run Pass 2 so the final answer states
+    exact, machine-computed figures instead of hallucinated digits. Returns
+    (clean_text, detected_language) — the same shape as extract_language()."""
+    raw = llm_reply(build_answer_prompt(query, combined_context, entity_note), provider=provider)
+
+    calc_requests = extract_calc_requests(raw)
+
+    # Reliability fallback: some chat models (mistral-small) won't emit a calc block even
+    # when arithmetic is needed — they list the operands and stop. If the selected
+    # provider didn't trigger it and the question looks computational, ask the reliable
+    # math provider to make the calc DECISION. The user's provider still writes the prose
+    # in Pass 2 below, so their provider choice is preserved for everything user-facing.
+    if (not calc_requests and provider != MATH_PROVIDER
+            and looks_computational(query)):
+        fallback = llm_reply(
+            build_answer_prompt(query, combined_context, entity_note),
+            provider=MATH_PROVIDER,
+        )
+        calc_requests = extract_calc_requests(fallback)
+
+    if not calc_requests:
+        return extract_language(raw)
+
+    results = run_calculations(calc_requests, combined_context)
+    computed_lines = "\n".join(
+        (f"- {r['label'] or r['expr']}: {r['expr']} = {r['result']}" if "result" in r
+         else f"- {r['label'] or r['expr']}: {r['expr']} could not be computed ({r['error']})")
+        for r in results
+    )
+    final = llm_reply(
+        build_calc_answer_prompt(query, combined_context, entity_note, computed_lines),
+        provider=provider,
+    )
+    return extract_language(final)
 
 # Authentication models
 class LoginRequest(BaseModel):
@@ -952,72 +1326,9 @@ Content:
                 "Answer for the present name(s) regardless of the missing one(s).\n"
             )
 
-    prompt = f"""
-You are NOVAC AI, a STRICT document-grounded extraction assistant. Your only job is to
-answer using the retrieved context below, for whatever document the user uploaded.
-
-User question:
-{data.query}
-{entity_note}
-
-Retrieved document context:
-{combined_context}
-
-STRICT RULES:
-1. Answer ONLY from the retrieved context above. Never use outside knowledge.
-2. Every amount, percentage, date, name and number you state must appear VERBATIM in the
-   context. Preserve it EXACTLY as written. Never invent a value.
-3. ATTRIBUTION: Each value in the context belongs to the specific entity (person, item,
-   product, period, etc.) it is written next to. Always pair a value with that exact
-   entity. NEVER assign one entity's figure to a different one. If the question names an
-   entity, use only the value(s) written for THAT entity.
-4. PARTIAL ANSWERS ARE REQUIRED. If the question names one or more entities (people,
-   items, products, periods, etc.), handle EACH one independently:
-   - If an entity IS present in the context, answer using its own values.
-   - If an entity is NOT present, write one short line saying it is not found, then
-     CONTINUE and answer for every entity that IS present.
-   Do NOT return the rule-9 "not found" sentence as long as at least ONE named entity is
-   present — this holds even for a "compare side by side" question where another named
-   entity is missing. Use rule 9 ONLY when NONE of the named entities appear in the context.
-   - Extra unrelated figures for a present entity (a different metric than the one asked
-     about) are not a reason to refuse; simply ignore the ones that don't match the question.
-   Illustrative example (fictional, unrelated to any uploaded document) — question
-   "Compare Alice's and Bob's score", context contains "Bob's score: 42" but no Alice:
-     "Alice is not found in the document.
-      Bob — score: 42"
-5. COMPARING & SELECTING IS ALLOWED. You MAY compare, rank, or pick among values that
-   already appear in the context — e.g. "which one is highest", "compare X and Y side by
-   side", or listing items that meet a stated condition. Choosing the largest/smallest of
-   values already written in the context is NOT inventing a number; it is selecting one
-   that is present. When ranking, compare the ACTUAL numeric magnitude of each value
-   (read digit-grouping/commas and units carefully so a larger number is not mistaken for
-   a smaller one) and pick the true highest/lowest. Show the values you compared.
-6. EXTRAPOLATION IS FORBIDDEN. Do NOT project, compute, or recompute figures for a new
-   rate, term, or assumption that is not already shown. If the asked-for figure is not
-   written in the context, use rule 9.
-7. If several variants of a value apply (e.g. different rates or scenarios), show each one
-   clearly and separately.
-8. Do NOT add advice, opinions, or extra explanations unless the user explicitly asks.
-9. If the answer simply is not present in the context, reply with exactly this sentence
-   (translated into the user's language): "Exact information not found in the retrieved
-   document sections."
-
-ANSWER FORMAT:
-- For a single fact: Line 1 is the direct answer; then at most one short supporting line
-  drawn straight from the context.
-- For a comparison/ranking: give the direct answer first (the winner, or "X vs Y"), then
-  list each entity with its value on its own line, each attributed by name.
-- Keep it concise and factual; never restate the question.
-
-LANGUAGE:
-- Answer in the EXACT same language and script as the user's question
-  (Hindi->Hindi, Tamil->Tamil, Tanglish->Tanglish, Hinglish->Hinglish, English->English).
-{LANG_TAG}
-
-Answer:
-"""
-
-    reply, language = extract_language(llm_reply(prompt, provider=provider))
+    reply, language = generate_grounded_answer(
+        data.query, combined_context, entity_note, provider
+    )
 
     return {
         "response": reply,
