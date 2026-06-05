@@ -428,7 +428,7 @@ function BotMeta({ message, isSpeaking, onSpeak, onReplay }) {
   )
 }
 
-/* ---------- ChatGPT-style word-by-word reveal with cursor ---------- */
+/* ---------- Word-by-word typing reveal with cursor ---------- */
 function TypewriterText({ text, active, onComplete }) {
   const [shown, setShown] = useState(active ? "" : text)
   const [done, setDone] = useState(!active)
