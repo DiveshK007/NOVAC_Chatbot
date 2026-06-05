@@ -24,6 +24,7 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 COPY fast_api.py .
 
-# Railway provides $PORT at runtime; default to 8000 for local `docker run`.
-EXPOSE 8000
-CMD uvicorn fast_api:app --host 0.0.0.0 --port ${PORT:-8000}
+# Hugging Face Docker Spaces expect the app on port 7860 (set via app_port in README.md).
+# $PORT is honored if the platform sets it, so this stays portable to other hosts.
+EXPOSE 7860
+CMD uvicorn fast_api:app --host 0.0.0.0 --port ${PORT:-7860}
