@@ -106,6 +106,22 @@ These need more RAM and a much bigger image, so they're off by default.
    (also upload `requirements-optional.txt` to the Space).
 2. Add Space secrets `ENABLE_OCR=true` and/or `ENABLE_VOICE=true`.
 
+### Optional: enable the knowledge graph (Neo4j)
+
+The graph is off unless `NEO4J_*` is configured. To turn it on, set these as secrets
+(the `neo4j` driver is already in `requirements.txt`):
+
+| Name | Value |
+|------|-------|
+| `NEO4J_URI` | `neo4j+s://<id>.databases.neo4j.io` (Aura) or `bolt://host:7687` (self-hosted) |
+| `NEO4J_USERNAME` | usually `neo4j` |
+| `NEO4J_PASSWORD` | your database password |
+| `NEO4J_DATABASE` | optional, defaults to `neo4j` |
+
+[Neo4j Aura](https://neo4j.com/cloud/aura-free/) has a free tier. Note: with the graph on,
+each uploaded chunk makes an extra LLM call to extract triples — slower uploads and more
+tokens (watch the Groq daily limit). Re-upload documents after enabling so the graph fills.
+
 ---
 
 ## Troubleshooting

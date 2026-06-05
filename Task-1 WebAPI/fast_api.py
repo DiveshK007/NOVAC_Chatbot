@@ -22,6 +22,12 @@ from pydantic import BaseModel, EmailStr
 from mistralai.client import MistralClient
 from dotenv import load_dotenv
 from groq import Groq
+# Neo4j is optional — guarded so the app still boots if the driver isn't installed.
+# The knowledge-graph feature only activates when both the driver and NEO4J_* are present.
+try:
+    from neo4j import GraphDatabase
+except ImportError:
+    GraphDatabase = None
 import json
 import requests
 from fastapi.responses import StreamingResponse
@@ -79,6 +85,23 @@ counters_collection = db["counters"]
 
 groq_api_key = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_api_key)
+
+# Neo4j knowledge graph (optional). Only built when the driver is installed AND the
+# connection env vars are set; otherwise neo4j_driver stays None and every graph helper
+# below no-ops, so the app behaves exactly as it does without a graph.
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+neo4j_driver = None
+if GraphDatabase and NEO4J_URI and NEO4J_USERNAME and NEO4J_PASSWORD:
+    try:
+        neo4j_driver = GraphDatabase.driver(
+            NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+        )
+    except Exception as e:
+        print("Neo4j driver init failed (knowledge graph disabled):", e)
+        neo4j_driver = None
 
 # ElevenLabs Configuration
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -484,6 +507,301 @@ def run_calculations(requests, context):
         results.append(entry)
     return results
 
+# ---------------------------------------------------------------------------
+# Knowledge graph (Neo4j) — optional. Every function below no-ops when
+# neo4j_driver is None, so the app runs identically when the graph isn't configured.
+# Ported from a teammate's branch; grounding stays document-only (triples are
+# extracted from chunk text via the LLM, never invented).
+# ---------------------------------------------------------------------------
+def _clean_graph_value(value, fallback: str = "Unknown") -> str:
+    """Normalize LLM-extracted graph fields without changing their meaning."""
+    if value is None:
+        return fallback
+    cleaned = " ".join(str(value).strip().split())
+    return cleaned or fallback
+
+def _entity_key(name: str, entity_type: str) -> str:
+    return f"{_clean_graph_value(entity_type).lower()}::{_clean_graph_value(name).lower()}"
+
+def _relation_type(value: str) -> str:
+    relation = re.sub(r"[^A-Za-z0-9_]+", "_", _clean_graph_value(value, "RELATED_TO"))
+    relation = re.sub(r"_+", "_", relation).strip("_").upper()
+    return relation or "RELATED_TO"
+
+def ensure_neo4j_schema():
+    """Create useful uniqueness constraints if Neo4j is configured."""
+    if not neo4j_driver:
+        return
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            session.run(
+                "CREATE CONSTRAINT document_name_unique IF NOT EXISTS "
+                "FOR (d:Document) REQUIRE d.name IS UNIQUE"
+            )
+            session.run(
+                "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS "
+                "FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE"
+            )
+            session.run(
+                "CREATE CONSTRAINT entity_key_unique IF NOT EXISTS "
+                "FOR (e:Entity) REQUIRE e.key IS UNIQUE"
+            )
+    except Exception as e:
+        print("Neo4j schema setup skipped:", e)
+
+def extract_graph_triples(chunk_content: str, provider: str = "mistral"):
+    """Use the selected LLM provider to extract document-grounded KG triples."""
+    if not neo4j_driver or not chunk_content:
+        return []
+
+    graph_prompt = f"""
+You are a knowledge graph extraction engine for a document-grounded chatbot.
+
+Extract factual relationships from the document chunk below.
+
+STRICT RULES:
+- Use ONLY facts explicitly stated in the chunk.
+- Do NOT infer, calculate, summarize, or add outside knowledge.
+- Extract concrete entities, values, dates, amounts, percentages, products, people,
+  organizations, requirements, limits, eligibility rules, benefits, and conditions.
+- Keep subject and object as short exact phrases from the chunk whenever possible.
+- Relation must be an uppercase snake_case verb phrase.
+- Return ONLY valid JSON.
+- Return a JSON array of objects.
+- Each object must contain exactly:
+  subject, subject_type, relation, object, object_type
+- If there are no useful relationships, return [].
+
+Example:
+[
+  {{
+    "subject": "Home Loan",
+    "subject_type": "Product",
+    "relation": "HAS_INTEREST_RATE",
+    "object": "8.5%",
+    "object_type": "Rate"
+  }}
+]
+
+DOCUMENT CHUNK:
+{chunk_content}
+"""
+    raw = llm_reply(graph_prompt, provider=provider, temperature=0.0)
+    try:
+        parsed = json.loads(extract_json_array(raw))
+    except Exception as e:
+        print("Graph extraction JSON parse failed:", e)
+        return []
+
+    triples = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        subject = _clean_graph_value(item.get("subject"), "")
+        obj = _clean_graph_value(item.get("object"), "")
+        if not subject or not obj:
+            continue
+        subject_type = _clean_graph_value(item.get("subject_type"), "Entity")
+        object_type = _clean_graph_value(item.get("object_type"), "Entity")
+        relation = _relation_type(item.get("relation"))
+        triples.append({
+            "subject": subject[:180],
+            "subject_type": subject_type[:80],
+            "subject_key": _entity_key(subject, subject_type),
+            "relation": relation[:80],
+            "object": obj[:180],
+            "object_type": object_type[:80],
+            "object_key": _entity_key(obj, object_type),
+        })
+    return triples[:30]
+
+def save_triples_to_neo4j(document: dict, triples):
+    """Persist chunk provenance and extracted triples into Neo4j."""
+    if not neo4j_driver:
+        return 0
+    ensure_neo4j_schema()
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            session.execute_write(
+                _save_triples_tx,
+                document["document_name"],
+                document["chunk_id"],
+                document.get("chunk_title", "Untitled Chunk"),
+                triples,
+            )
+        return len(triples)
+    except Exception as e:
+        print("Neo4j triple save failed:", e)
+        return 0
+
+def _save_triples_tx(tx, document_name, chunk_id, chunk_title, triples):
+    tx.run(
+        """
+        MERGE (d:Document {name: $document_name})
+        MERGE (c:Chunk {chunk_id: $chunk_id})
+        SET c.title = $chunk_title,
+            c.document_name = $document_name
+        MERGE (d)-[:HAS_CHUNK]->(c)
+        """,
+        document_name=document_name,
+        chunk_id=chunk_id,
+        chunk_title=chunk_title,
+    )
+    if not triples:
+        return
+    tx.run(
+        """
+        MATCH (c:Chunk {chunk_id: $chunk_id})
+        UNWIND $triples AS t
+        MERGE (s:Entity {key: t.subject_key})
+        SET s.name = t.subject,
+            s.type = t.subject_type
+        MERGE (o:Entity {key: t.object_key})
+        SET o.name = t.object,
+            o.type = t.object_type
+        MERGE (c)-[:MENTIONS]->(s)
+        MERGE (c)-[:MENTIONS]->(o)
+        MERGE (s)-[r:RELATION {
+            type: t.relation,
+            chunk_id: $chunk_id,
+            object_key: t.object_key
+        }]->(o)
+        SET r.document_name = $document_name,
+            r.chunk_title = $chunk_title
+        """,
+        document_name=document_name,
+        chunk_id=chunk_id,
+        chunk_title=chunk_title,
+        triples=triples,
+    )
+
+def delete_document_graph(document_names):
+    """Remove graph data belonging to deleted or overwritten documents."""
+    if not neo4j_driver or not document_names:
+        return
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            session.execute_write(_delete_document_graph_tx, document_names)
+    except Exception as e:
+        print("Neo4j document graph delete failed:", e)
+
+def _delete_document_graph_tx(tx, document_names):
+    tx.run(
+        """
+        MATCH ()-[r:RELATION]->()
+        WHERE r.document_name IN $document_names
+        DELETE r
+        """,
+        document_names=document_names,
+    )
+    tx.run(
+        """
+        MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)
+        WHERE d.name IN $document_names
+        DETACH DELETE c
+        """,
+        document_names=document_names,
+    )
+    tx.run(
+        """
+        MATCH (d:Document)
+        WHERE d.name IN $document_names
+        DETACH DELETE d
+        """,
+        document_names=document_names,
+    )
+    tx.run("MATCH (e:Entity) WHERE NOT (e)--() DELETE e")
+
+def delete_chunk_graph(chunk_id: int):
+    """Remove graph data for one chunk before rebuilding it."""
+    if not neo4j_driver:
+        return
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            session.execute_write(_delete_chunk_graph_tx, chunk_id)
+    except Exception as e:
+        print("Neo4j chunk graph delete failed:", e)
+
+def _delete_chunk_graph_tx(tx, chunk_id):
+    tx.run(
+        "MATCH ()-[r:RELATION {chunk_id: $chunk_id}]->() DELETE r",
+        chunk_id=chunk_id,
+    )
+    tx.run(
+        "MATCH (c:Chunk {chunk_id: $chunk_id}) DETACH DELETE c",
+        chunk_id=chunk_id,
+    )
+    tx.run("MATCH (e:Entity) WHERE NOT (e)--() DELETE e")
+
+def graph_query_terms(query: str):
+    terms = []
+    seen = set()
+    for token in _tokenize(query):
+        if len(token) < 3 or token in _STOPWORDS:
+            continue
+        if token not in seen:
+            seen.add(token)
+            terms.append(token)
+    return terms[:12]
+
+def search_neo4j_facts(query: str, chunk_ids=None, limit: int = 20):
+    """Retrieve graph facts that match the query terms or current top chunks."""
+    if not neo4j_driver:
+        return []
+    terms = graph_query_terms(query)
+    chunk_ids = chunk_ids or []
+    if not terms and not chunk_ids:
+        return []
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            result = session.run(
+                """
+                MATCH (s:Entity)-[r:RELATION]->(o:Entity)
+                WHERE
+                    ($chunk_ids <> [] AND r.chunk_id IN $chunk_ids)
+                    OR any(term IN $terms WHERE
+                        toLower(s.name) CONTAINS term OR
+                        toLower(o.name) CONTAINS term OR
+                        toLower(r.type) CONTAINS term OR
+                        toLower(coalesce(r.document_name, '')) CONTAINS term
+                    )
+                RETURN DISTINCT
+                    s.name AS subject,
+                    s.type AS subject_type,
+                    r.type AS relation,
+                    o.name AS object,
+                    o.type AS object_type,
+                    r.document_name AS document_name,
+                    r.chunk_title AS chunk_title,
+                    r.chunk_id AS chunk_id,
+                    CASE WHEN r.chunk_id IN $chunk_ids THEN 0 ELSE 1 END AS rank
+                ORDER BY rank, document_name, chunk_title
+                LIMIT $limit
+                """,
+                terms=terms,
+                chunk_ids=chunk_ids,
+                limit=limit,
+            )
+            return [dict(record) for record in result]
+    except Exception as e:
+        print("Neo4j fact search failed:", e)
+        return []
+
+def format_graph_facts(facts):
+    if not facts:
+        return ""
+    lines = []
+    for fact in facts:
+        lines.append(
+            f"- {fact['subject']} ({fact['subject_type']}) "
+            f"-[{fact['relation']}]-> "
+            f"{fact['object']} ({fact['object_type']}) "
+            f"[Document: {fact.get('document_name')}, "
+            f"Chunk: {fact.get('chunk_title')}, "
+            f"chunk_id: {fact.get('chunk_id')}]"
+        )
+    return "\n".join(lines)
+
 def build_sources(chunks):
     """Shape chunks into source-card payloads for the frontend."""
     return [
@@ -690,9 +1008,11 @@ def literal_filter_chunks(query: str, similarities):
 # Shared rule blocks so Pass 1 (which may request a calculation) and Pass 2 (which
 # states the computed result) stay perfectly consistent in their grounding rules.
 _STRICT_RULES = """STRICT RULES:
-1. Answer ONLY from the retrieved context above. Never use outside knowledge.
+1. Answer ONLY from the retrieved document context and knowledge graph facts above.
+   Never use outside knowledge.
 2. Every amount, percentage, date, name and number you state must appear VERBATIM in the
-   context. Preserve it EXACTLY as written. Never invent a value.
+   document context or the knowledge graph facts. Preserve it EXACTLY as written. Never
+   invent a value.
 3. ATTRIBUTION: Each value in the context belongs to the specific entity (person, item,
    product, period, etc.) it is written next to. Always pair a value with that exact
    entity. NEVER assign one entity's figure to a different one. If the question names an
@@ -765,11 +1085,23 @@ _ANSWER_FORMAT = """ANSWER FORMAT:
   list each entity with its value on its own line, each attributed by name.
 - Keep it concise and factual; never restate the question.
 
-LANGUAGE:
-- Answer in the EXACT same language and script as the user's question
-  (Hindi->Hindi, Tamil->Tamil, Tanglish->Tanglish, Hinglish->Hinglish, English->English)."""
+LANGUAGE (CRITICAL — applies to EVERY line of your answer, not just the first):
+- Detect the language AND script of the user's question and write your ENTIRE reply in that
+  same language/script — the direct answer AND any supporting line
+  (Hindi->Hindi, Tamil->Tamil, Telugu->Telugu, English->English; romanized
+  Tanglish/Hinglish->that same romanized form).
+- The retrieved context is usually in English. Keep ONLY numbers, currency, dates, and
+  proper names exactly as written; TRANSLATE all surrounding words into the user's language.
+  Do NOT copy English sentences from the context verbatim into your answer.
+- Never switch to English unless the user actually wrote in English."""
 
-def build_answer_prompt(query, combined_context, entity_note):
+def _graph_block(graph_context):
+    """Render the knowledge-graph facts section, or nothing when the graph is off/empty."""
+    if not graph_context:
+        return ""
+    return f"\nRetrieved knowledge graph facts:\n{graph_context}\n"
+
+def build_answer_prompt(query, combined_context, entity_note, graph_context=""):
     """Pass-1 prompt: the model either answers directly or, if arithmetic on context
     numbers is needed, emits a calc protocol block instead of computing it itself."""
     return f"""
@@ -779,7 +1111,7 @@ answer using the retrieved context below, for whatever document the user uploade
 User question:
 {query}
 {entity_note}
-
+{_graph_block(graph_context)}
 Retrieved document context:
 {combined_context}
 
@@ -793,7 +1125,7 @@ Retrieved document context:
 Answer:
 """
 
-def build_calc_answer_prompt(query, combined_context, entity_note, computed_lines):
+def build_calc_answer_prompt(query, combined_context, entity_note, computed_lines, graph_context=""):
     """Pass-2 prompt: the math has already been done in Python. The model writes the
     final grounded answer stating the exact computed value(s) — it must not recompute."""
     return f"""
@@ -802,7 +1134,7 @@ You are NOVAC AI, a STRICT document-grounded extraction assistant.
 User question:
 {query}
 {entity_note}
-
+{_graph_block(graph_context)}
 Retrieved document context:
 {combined_context}
 
@@ -839,13 +1171,16 @@ def looks_computational(query: str) -> bool:
     """Best-effort: does the question read like it needs arithmetic on context numbers?"""
     return bool(_MATH_INTENT_RE.search(query or ""))
 
-def generate_grounded_answer(query, combined_context, entity_note, provider):
+def generate_grounded_answer(query, combined_context, entity_note, provider, graph_context=""):
     """Generate the final answer, with an optional Python-computed math pass.
     Pass 1: the model answers directly OR emits a calc protocol block. If it asked for
     arithmetic, evaluate it safely in Python and run Pass 2 so the final answer states
     exact, machine-computed figures instead of hallucinated digits. Returns
     (clean_text, detected_language) — the same shape as extract_language()."""
-    raw = llm_reply(build_answer_prompt(query, combined_context, entity_note), provider=provider)
+    raw = llm_reply(
+        build_answer_prompt(query, combined_context, entity_note, graph_context),
+        provider=provider,
+    )
 
     calc_requests = extract_calc_requests(raw)
 
@@ -857,7 +1192,7 @@ def generate_grounded_answer(query, combined_context, entity_note, provider):
     if (not calc_requests and provider != MATH_PROVIDER
             and looks_computational(query)):
         fallback = llm_reply(
-            build_answer_prompt(query, combined_context, entity_note),
+            build_answer_prompt(query, combined_context, entity_note, graph_context),
             provider=MATH_PROVIDER,
         )
         calc_requests = extract_calc_requests(fallback)
@@ -865,14 +1200,17 @@ def generate_grounded_answer(query, combined_context, entity_note, provider):
     if not calc_requests:
         return extract_language(raw)
 
-    results = run_calculations(calc_requests, combined_context)
+    # Provenance scan includes the graph facts so a number that appears in a graph fact
+    # (but not the chunk prose) still counts as grounded for the calc guard.
+    provenance_context = f"{combined_context}\n{graph_context}"
+    results = run_calculations(calc_requests, provenance_context)
     computed_lines = "\n".join(
         (f"- {r['label'] or r['expr']}: {r['expr']} = {r['result']}" if "result" in r
          else f"- {r['label'] or r['expr']}: {r['expr']} could not be computed ({r['error']})")
         for r in results
     )
     final = llm_reply(
-        build_calc_answer_prompt(query, combined_context, entity_note, computed_lines),
+        build_calc_answer_prompt(query, combined_context, entity_note, computed_lines, graph_context),
         provider=provider,
     )
     return extract_language(final)
@@ -935,6 +1273,7 @@ async def delete_documents(req: DeleteDocsRequest, user: dict = Depends(require_
          
     try:
          result = collection.delete_many({"document_name": {"$in": docs_to_delete}})
+         delete_document_graph(docs_to_delete)
          reset_conversation_memory()
          return {
               "success": True,
@@ -1130,6 +1469,8 @@ async def upload_file(
     collection.delete_many({
         "document_name": document_name
     })
+    # Drop any prior knowledge-graph data for this document (no-op if graph disabled).
+    delete_document_graph([document_name])
 
     saved_chunks = []
     for idx, chunk_data in enumerate(chunks):
@@ -1148,11 +1489,16 @@ async def upload_file(
             "embedding": embedding
         }
         collection.insert_one(document)
+        # Extract + persist knowledge-graph triples for this chunk. No-ops (returns 0)
+        # when the graph isn't configured, so non-graph uploads are unaffected.
+        triples = extract_graph_triples(chunk_content, provider=provider)
+        graph_triples_saved = save_triples_to_neo4j(document, triples)
         saved_chunks.append({
             "chunk_id": document["chunk_id"],
             "document_name": document_name,
             "chunk_title": chunk_title,
-            "chunk": chunk_content
+            "chunk": chunk_content,
+            "graph_triples_saved": graph_triples_saved
         })
     return {
         "message": "File uploaded successfully",
@@ -1264,6 +1610,7 @@ If it's a thanks/acknowledgement, respond politely and offer further help.
         )[0][0]
 
         similarities.append({
+            "chunk_id": chunk.get("chunk_id"),
             "chunk": chunk["chunk"],
             "chunk_title": chunk.get("chunk_title", "Untitled Chunk"),
             "document_name": chunk.get("document_name") or UNKNOWN_DOC,
@@ -1350,6 +1697,14 @@ Content:
         for chunk in top_chunks
     ])
 
+    # Knowledge-graph facts for this query (empty string when the graph isn't configured,
+    # so the prompt and downstream logic are unchanged in that case).
+    graph_facts = search_neo4j_facts(
+        data.query,
+        chunk_ids=[c["chunk_id"] for c in top_chunks if c.get("chunk_id") is not None],
+    )
+    graph_context = format_graph_facts(graph_facts)
+
     # Deterministic presence check: tell the model exactly which of the names it asked
     # about actually occur in the retrieved context and which don't. This removes the
     # ambiguity that makes a partial comparison (some subjects present, some absent)
@@ -1405,13 +1760,14 @@ Content:
             )
 
     reply, language = generate_grounded_answer(
-        data.query, combined_context, entity_note, provider
+        data.query, combined_context, entity_note, provider, graph_context=graph_context
     )
 
     return {
         "response": reply,
         "detected_language": language,
         "chunks_used": len(top_chunks),
+        "graph_facts_used": len(graph_facts),
         "sources": build_sources(top_chunks)
     }
 # Retrieve all chunks endpoint
@@ -1432,6 +1788,8 @@ async def get_chunks(user: dict = Depends(require_admin)):
 @app.post("/update-chunk")
 async def update_chunk(data: ChunkUpdate, user: dict = Depends(require_admin)):
 
+    existing_chunk = collection.find_one({"chunk_id": data.chunk_id})
+
     # Generate new embedding for updated chunk
     updated_embedding = model.encode(
         data.updated_chunk
@@ -1448,6 +1806,18 @@ async def update_chunk(data: ChunkUpdate, user: dict = Depends(require_admin)):
             }
         }
     )
+
+    # Rebuild this chunk's knowledge-graph triples from the edited text (no-op if the
+    # graph is disabled). Delete the old triples first so stale facts don't linger.
+    if existing_chunk:
+        updated_document = {
+            "chunk_id": data.chunk_id,
+            "document_name": existing_chunk.get("document_name") or UNKNOWN_DOC,
+            "chunk_title": existing_chunk.get("chunk_title", "Untitled Chunk"),
+        }
+        delete_chunk_graph(data.chunk_id)
+        triples = extract_graph_triples(data.updated_chunk, provider="mistral")
+        save_triples_to_neo4j(updated_document, triples)
 
     # Reset conversational retrieval memory (corpus changed)
     reset_conversation_memory()
