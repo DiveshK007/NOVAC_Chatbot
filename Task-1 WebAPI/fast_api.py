@@ -34,6 +34,27 @@ from fastapi.responses import StreamingResponse
 from io import BytesIO
 # Load environment variables
 load_dotenv()
+# =============================================================================
+#  NOVAC backend — single-file FastAPI app. Section map:
+#   1. SETUP & CLIENTS ......... env, CORS, models, Mongo, LLM clients, Neo4j
+#   2. AUTH .................... password hashing + JWT
+#   3. USERS & ID COUNTER ...... seed users, atomic chunk ids
+#   4. CONVERSATION MEMORY ..... per-user follow-up state
+#   5. MULTILINGUAL HELPERS .... language tag + in-language messages
+#   6. LLM PROVIDERS ........... mistral / groq / grok dispatch
+#   7. CALC TOOL ............... safe arithmetic + operand-provenance guard
+#   8. KNOWLEDGE GRAPH ......... Neo4j triple extract/store/query (optional)
+#   9. RESPONSE & LANGUAGE ..... source cards, language extraction
+#  10. RETRIEVAL SCORING ....... small-talk, hybrid-rerank tuning, keyword score
+#  11. PER-ENTITY RETRIEVAL .... multi-entity / comparison queries
+#  12. ENUMERATION FILTER ...... "list every item with X and Y" queries
+#  13. PROMPTS & ANSWERING ..... grounding rules, calc + case-study, answer gen
+#  14. API MODELS & ROUTES ..... /login /upload /search /chunks /tts /voice
+# =============================================================================
+
+# =============================================================================
+#  1. SETUP & CLIENTS
+# =============================================================================
 app = FastAPI()
 # Allow the React frontend to connect. Origins come from FRONTEND_ORIGINS (comma-separated)
 # so the deployed Vercel URL can be added in the cloud without a code change; defaults to
@@ -107,9 +128,9 @@ if GraphDatabase and NEO4J_URI and NEO4J_USERNAME and NEO4J_PASSWORD:
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
-# ---------------------------------------------------------------------------
-# Password hashing (bcrypt)
-# ---------------------------------------------------------------------------
+# =============================================================================
+#  2. AUTH — password hashing (bcrypt) + JWT
+# =============================================================================
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -155,9 +176,9 @@ def require_admin(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
-# ---------------------------------------------------------------------------
-# Atomic, collision-free chunk id generator
-# ---------------------------------------------------------------------------
+# =============================================================================
+#  3. USERS & ID COUNTER — seeded logins + atomic chunk ids
+# =============================================================================
 def next_chunk_id() -> int:
     doc = counters_collection.find_one_and_update(
         {"_id": "chunk_id"},
@@ -189,6 +210,9 @@ def ensure_user(email: str, password: str, role: str):
 ensure_user("admin@novac.com", "admin", "admin")
 ensure_user("user@novac.com", "user", "user")
 
+# =============================================================================
+#  4. CONVERSATION MEMORY — per-user follow-up ("more") state
+# =============================================================================
 # Conversational retrieval memory, keyed per authenticated user.
 # Each entry: {"results": [...], "index": int, "query": str}
 conversation_state = {}
@@ -197,9 +221,9 @@ def reset_conversation_memory():
     """Clear all conversational memory (corpus changed)."""
     conversation_state.clear()
 
-# ---------------------------------------------------------------------------
-# Multilingual helpers
-# ---------------------------------------------------------------------------
+# =============================================================================
+#  5. MULTILINGUAL HELPERS — language tag + in-language messages
+# =============================================================================
 # Appended to prompts so the model tags which language it answered in.
 LANG_TAG = (
     "\n\nAt the very end of your reply, on a new line, append exactly: "
@@ -240,6 +264,9 @@ MATH_PROVIDER = "groq"
 # "not found"). Generic: no document- or name-specific logic.
 CASE_STUDY_MODE = True
 
+# =============================================================================
+#  6. LLM PROVIDERS — mistral / groq / grok, with a unified dispatch
+# =============================================================================
 def mistral_reply(prompt: str, temperature: float = 0.1, retries: int = 2) -> str:
     """Call Mistral with a couple of retries; on persistent failure return a
     graceful message instead of raising (so the chat never hard-fails)."""
@@ -335,9 +362,10 @@ def extract_json_array(text: str) -> str:
         return t[start:end + 1]
     return t
 
-# ---------------------------------------------------------------------------
+# =============================================================================
+#  7. CALC TOOL — safe arithmetic evaluator + operand-provenance guard
+# =============================================================================
 # Tool-based computation: safe arithmetic evaluator
-# ---------------------------------------------------------------------------
 # The LLM stays a reasoner/extractor — it pulls the relevant numbers out of the
 # retrieved context and decides what operation is needed. Python does the actual
 # arithmetic, so a stated figure is correct by construction rather than a
@@ -507,8 +535,10 @@ def run_calculations(requests, context):
         results.append(entry)
     return results
 
-# ---------------------------------------------------------------------------
-# Knowledge graph (Neo4j) — optional. Every function below no-ops when
+# =============================================================================
+#  8. KNOWLEDGE GRAPH — Neo4j triple extract / store / query (optional)
+# =============================================================================
+# Every function below no-ops when
 # neo4j_driver is None, so the app runs identically when the graph isn't configured.
 # Ported from a teammate's branch; grounding stays document-only (triples are
 # extracted from chunk text via the LLM, never invented).
@@ -802,6 +832,9 @@ def format_graph_facts(facts):
         )
     return "\n".join(lines)
 
+# =============================================================================
+#  9. RESPONSE & LANGUAGE HELPERS — source cards, language extraction
+# =============================================================================
 def build_sources(chunks):
     """Shape chunks into source-card payloads for the frontend."""
     return [
@@ -839,6 +872,9 @@ def in_language_message(user_text: str, instruction: str):
 {LANG_MATCH_RULE} Keep it to one short sentence.{LANG_TAG}"""
     return extract_language(mistral_reply(prompt, temperature=0.0))
 
+# =============================================================================
+#  10. RETRIEVAL SCORING — small-talk sets, hybrid-rerank tuning, keyword score
+# =============================================================================
 # Small-talk that should be answered conversationally (in-language), not via RAG.
 GREETING_WORDS = {
     "hi", "hello", "hey", "hii", "heyy", "good morning", "good evening",
@@ -881,9 +917,9 @@ def keyword_score(query: str, text: str) -> float:
     hits = sum(1 for w in q_terms if w in haystack)
     return hits / len(q_terms)
 
-# ---------------------------------------------------------------------------
-# Per-entity retrieval (multi-entity / comparison queries)
-# ---------------------------------------------------------------------------
+# =============================================================================
+#  11. PER-ENTITY RETRIEVAL — multi-entity / comparison queries
+# =============================================================================
 # A single blended embedding for a multi-entity question (e.g. "Compare X's and Y's
 # figures") tends to retrieve chunks about neither subject specifically — or only one
 # of them. When the question names subjects, we run an extra keyword-grounded pass per
@@ -954,9 +990,9 @@ def merge_entity_chunks(top_chunks, similarities, entities):
         add(c)
     return merged[:MAX_CONTEXT]
 
-# ---------------------------------------------------------------------------
-# Enumeration / literal-filter queries ("list every item that has both X and Y")
-# ---------------------------------------------------------------------------
+# =============================================================================
+#  12. ENUMERATION FILTER — "list every item that has both X and Y"
+# =============================================================================
 # Semantic + hybrid retrieval ranks by *similarity*, so an exhaustive "find every
 # chunk that literally contains X and Y" query misses matches that simply aren't in
 # the top-K shortlist. For these we scan the WHOLE corpus for the literal tokens the
@@ -1002,9 +1038,9 @@ def literal_filter_chunks(query: str, similarities):
     ]
     return matches[:MAX_CONTEXT]
 
-# ---------------------------------------------------------------------------
-# Grounded answer generation (with optional Python-computed math pass)
-# ---------------------------------------------------------------------------
+# =============================================================================
+#  13. PROMPTS & ANSWER GENERATION — grounding rules, calc + case-study, gen
+# =============================================================================
 # Shared rule blocks so Pass 1 (which may request a calculation) and Pass 2 (which
 # states the computed result) stay perfectly consistent in their grounding rules.
 _STRICT_RULES = """STRICT RULES:
@@ -1215,6 +1251,9 @@ def generate_grounded_answer(query, combined_context, entity_note, provider, gra
     )
     return extract_language(final)
 
+# =============================================================================
+#  14. API MODELS & ROUTES — /login /upload /search /chunks /update-chunk /tts /voice
+# =============================================================================
 # Authentication models
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -1461,7 +1500,6 @@ async def upload_file(
                 "content": section
             })
 
-    print("FINAL CHUNKS:", chunks)
     # Reset conversational memory for everyone (the corpus just changed)
     reset_conversation_memory()
 
