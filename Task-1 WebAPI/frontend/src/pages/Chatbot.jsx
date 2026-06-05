@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo } from "react"
 import { useNavigate } from "react-router-dom"
 import { authHeader, handleUnauthorized } from "../auth"
 
-const API = "http://127.0.0.1:8000"
+const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
 
 function Chatbot() {
   const navigate = useNavigate()

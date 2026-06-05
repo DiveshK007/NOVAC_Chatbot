@@ -1,0 +1,7 @@
+# Optional heavy features. Install these ONLY if you enable the matching flags:
+#   ENABLE_OCR=true    -> image-upload OCR (paddleocr + paddlepaddle, ~1.5 GB)
+#   ENABLE_VOICE=true  -> voice transcription (openai-whisper, also needs ffmpeg on the host)
+# These roughly triple the image size and need a larger instance, so they are off by default.
+paddleocr==3.5.0
+paddlepaddle==3.3.1
+openai-whisper==20250625

@@ -12,13 +12,13 @@ import time
 import bcrypt
 import jwt
 from datetime import datetime, timedelta, timezone
-from nltk.tokenize import word_tokenize
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from pypdf import PdfReader
 from pydantic import BaseModel, EmailStr
-from paddleocr import PaddleOCR
-import whisper
+# NOTE: PaddleOCR (image OCR) and Whisper (voice) are imported lazily inside
+# get_ocr()/get_whisper() below — they pull in paddlepaddle/torch and are huge, so we
+# only load them when their feature flag is on. This keeps the default cloud image small.
 from mistralai.client import MistralClient
 from dotenv import load_dotenv
 from groq import Groq
@@ -29,21 +29,46 @@ from io import BytesIO
 # Load environment variables
 load_dotenv()
 app = FastAPI()
-# Allow React frontend connection
+# Allow the React frontend to connect. Origins come from FRONTEND_ORIGINS (comma-separated)
+# so the deployed Vercel URL can be added in the cloud without a code change; defaults to
+# the local Vite dev server for development.
+_default_origins = "http://localhost:5173,http://127.0.0.1:5173"
+allowed_origins = [
+    o.strip() for o in os.getenv("FRONTEND_ORIGINS", _default_origins).split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 model = SentenceTransformer('all-MiniLM-L6-v2')
-ocr = PaddleOCR(lang='en')
-whisper_model = whisper.load_model("base")
-client = MongoClient("mongodb://localhost:27017/")
+
+# Optional heavy features, off by default so the cloud image stays small. Flip the env flag
+# to "1"/"true" AND install the optional deps (see requirements-optional.txt) to enable.
+ENABLE_OCR = os.getenv("ENABLE_OCR", "false").lower() in ("1", "true", "yes")
+ENABLE_VOICE = os.getenv("ENABLE_VOICE", "false").lower() in ("1", "true", "yes")
+_ocr = None
+_whisper_model = None
+
+def get_ocr():
+    """Lazily build the PaddleOCR engine on first use (heavy import: paddlepaddle)."""
+    global _ocr
+    if _ocr is None:
+        from paddleocr import PaddleOCR
+        _ocr = PaddleOCR(lang='en')
+    return _ocr
+
+def get_whisper():
+    """Lazily load the Whisper model on first use (heavy import: whisper/torch)."""
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        _whisper_model = whisper.load_model("base")
+    return _whisper_model
+
+client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
 db = client["novac_db"]
 # MongoDB collection and Mistral client
 collection = db["chunks"]
@@ -952,7 +977,13 @@ async def upload_file(
         file.filename.endswith(".jpg") or
         file.filename.endswith(".jpeg")
     ):
-        result = ocr.ocr(filepath)
+        if not ENABLE_OCR:
+            raise HTTPException(
+                status_code=503,
+                detail="Image OCR is disabled on this server. Set ENABLE_OCR=true (and "
+                       "install the optional OCR dependencies) to enable image uploads.",
+            )
+        result = get_ocr().ocr(filepath)
         extracted_lines = []
         if result:
             for page in result:
@@ -1470,12 +1501,18 @@ async def text_to_speech(data: SearchQuery, user: dict = Depends(get_current_use
 # Voice to text endpoint
 @app.post("/voice")
 async def voice_to_text(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    if not ENABLE_VOICE:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice transcription is disabled on this server. Set ENABLE_VOICE=true "
+                   "(and install the optional voice dependencies) to enable it.",
+        )
     os.makedirs("uploads", exist_ok=True)
     filepath = os.path.join("uploads", file.filename)
     content = await file.read()
     with open(filepath, "wb") as f:
         f.write(content)
-    result = whisper_model.transcribe(filepath)
+    result = get_whisper().transcribe(filepath)
     return {
         "text": result["text"]
     }

@@ -1,0 +1,13 @@
+# Keep the build context (and image) small and secret-free.
+frontend/
+flask_api.py
+uploads/
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.git/
+.DS_Store
+*.md
+requirements-optional.txt
